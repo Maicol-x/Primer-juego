@@ -326,7 +326,7 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
         {/* Acciones del Modal */}
         <div className="flex items-center justify-between gap-3 px-6 py-4 border-t border-neutral-800 bg-neutral-900/60">
           <button
-            onClick={onClose}
+            onClick={handleClose}
             disabled={isSpinning}
             className="px-4 py-2.5 rounded-xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 text-xs font-semibold text-neutral-300 transition-colors disabled:opacity-50 cursor-pointer"
           >
