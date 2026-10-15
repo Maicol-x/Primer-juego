@@ -128,9 +128,40 @@ Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
   writable: true,
 });
 
-// requestAnimationFrame: control manual en las pruebas
-(globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }).requestAnimationFrame = () => 0;
-(globalThis as unknown as { cancelAnimationFrame: (id: number) => void }).cancelAnimationFrame = () => {};
+// requestAnimationFrame: cola controlada por las pruebas. A diferencia del
+// stub anterior (que devolvía 0 sin ejecutar el callback), esta versión
+// ENCOLA los callbacks de forma realista para poder demostrar que el bucle
+// de animación avanza, se detiene al pausar y NO se duplica al reanudar.
+type RafCallback = (t: number) => void;
+const rafQueue: Map<number, RafCallback> = new Map();
+let rafNextId = 1;
+(globalThis as unknown as { requestAnimationFrame: (cb: RafCallback) => number }).requestAnimationFrame = (
+  cb: RafCallback,
+) => {
+  const id = rafNextId++;
+  rafQueue.set(id, cb);
+  return id;
+};
+(globalThis as unknown as { cancelAnimationFrame: (id: number) => void }).cancelAnimationFrame = (
+  id: number,
+) => {
+  rafQueue.delete(id);
+};
+// Utilidad global para tests: ejecuta exactamente UN frame pendiente.
+// Devuelve true si había un callback encolado (bucle activo).
+(globalThis as unknown as { __runOneFrame: (t?: number) => boolean }).__runOneFrame = (
+  t = performance.now(),
+) => {
+  if (rafQueue.size === 0) return false;
+  const [firstId, firstCb] = [...rafQueue.entries()][0];
+  rafQueue.delete(firstId);
+  firstCb(t);
+  return true;
+};
+(globalThis as unknown as { __pendingFrames: () => number }).__pendingFrames = () =>
+  rafQueue.size;
+(globalThis as unknown as { __clearFrames: () => void }).__clearFrames = () =>
+  rafQueue.clear();
 
 // --- Stub de AudioContext (audio.ts lo usa perezosamente, por seguridad) ---
 class FakeAudioContext {

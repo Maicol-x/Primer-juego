@@ -89,10 +89,14 @@ describe('Economía de la Caja Misteriosa (requestMysterySpin)', () => {
     expect(secondRapidClick).toBeNull();
     expect(p.coins).toBe(MYSTERY_BOX_COST * 4); // un solo cobro pese a dos clics
 
-    engine.resolveMysterySpin();
+    // Transacción completa: reclamar el premio de la primera tirada libera la
+    // pendencia. resolveMysterySpin() ya NO desbloquea mientras exista un
+    // premio pagado sin reclamar (regla anti-pérdida de recompensa).
+    engine.applyMysteryDrop(first!);
     const third = engine.requestMysterySpin();
     expect(third).not.toBeNull();
     expect(p.coins).toBe(MYSTERY_BOX_COST * 3);
+    engine.cancelMysterySpin(MYSTERY_BOX_COST); // limpiar la segunda pendencia
   });
 
   it('con saldo insuficiente no gira ni consume dinero', () => {
@@ -106,14 +110,23 @@ describe('Economía de la Caja Misteriosa (requestMysterySpin)', () => {
     expect(p.coins).toBe(MYSTERY_BOX_COST - 1); // intacto, sin cobro parcial
   });
 
-  it('applyMysteryDrop libera la pendencia aunque se cierre sin reclamar antes', () => {
+  it('resolveMysterySpin NO libera con premio pendiente; cancelMysterySpin sí (con reembolso)', () => {
     const { engine } = makeEngine();
     engine.player.coins = MYSTERY_BOX_COST * 2;
 
-    engine.requestMysterySpin();
-    engine.resolveMysterySpin(); // simulación de cierre del modal
+    const drop = engine.requestMysterySpin();
+    engine.resolveMysterySpin(); // fin de animación sin reclamar: NO debe desbloquear
+    expect(engine.requestMysterySpin()).toBeNull(); // sigue bloqueado (premio pagado vivo)
 
-    expect(engine.requestMysterySpin()).not.toBeNull(); // puede volver a girar
+    // Ruta correcta de cierre sin reclamar: cancelación con devolución exacta.
+    const coinsAfterBlockedTry = engine.player.coins;
+    engine.cancelMysterySpin(MYSTERY_BOX_COST);
+    expect(engine.player.coins).toBe(coinsAfterBlockedTry + MYSTERY_BOX_COST);
+    void drop;
+
+    // Ahora sí puede volver a girar.
+    expect(engine.requestMysterySpin()).not.toBeNull();
+    engine.cancelMysterySpin(MYSTERY_BOX_COST);
   });
 
   it('tras game over no se admiten giros', () => {
