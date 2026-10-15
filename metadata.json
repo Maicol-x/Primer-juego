@@ -1,0 +1,6 @@
+{
+  "name": "Zona Cero: Horda Zombie",
+  "description": "Juego de supervivencia y defensa de base contra oleadas zombies con armas mejorables y caja misteriosa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
