@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { MysteryBoxDrop } from '../game/types';
 import { MYSTERY_BOX_DROPS, MYSTERY_BOX_COST } from '../game/weapons';
 import { sound } from '../game/audio';
@@ -24,7 +24,13 @@ interface MysteryBoxModalProps {
   isOpen: boolean;
   onClose: () => void;
   coins: number;
+  /**
+   * Única operación de giro: el motor comprueba saldo, cobra una vez y
+   * devuelve la recompensa REAL generada (o null si no puede girar).
+   */
   onSpin: () => MysteryBoxDrop | null;
+  /** Notifica al motor que el giro terminó (o fue cancelado al cerrar). */
+  onSpinResolved?: () => void;
   onClaimDrop: (drop: MysteryBoxDrop) => void;
 }
 
@@ -33,6 +39,7 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
   onClose,
   coins,
   onSpin,
+  onSpinResolved,
   onClaimDrop,
 }) => {
   const [isSpinning, setIsSpinning] = useState(false);
@@ -40,22 +47,63 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
   const [wonDrop, setWonDrop] = useState<MysteryBoxDrop | null>(null);
   const [showProbabilities, setShowProbabilities] = useState(false);
 
+  // Referencias estables para limpiar SIEMPRE el temporizador del giro,
+  // incluso si el modal se desmonta o se cierra a mitad de animación.
+  const spinIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mountedRef = useRef(true);
+  // Última props sin re-ejecutar el efecto auto-spin por cambios de callbacks.
+  const onSpinRef = useRef(onSpin);
+  onSpinRef.current = onSpin;
+
+  const clearSpinInterval = () => {
+    if (spinIntervalRef.current !== null) {
+      clearInterval(spinIntervalRef.current);
+      spinIntervalRef.current = null;
+    }
+  };
+
   useEffect(() => {
-    if (isOpen && !wonDrop && !isSpinning) {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearSpinInterval();
+    };
+  }, []);
+
+  // Al abrir/cerrar el modal reiniciamos el estado visual. El cierre también
+  // libera la pendencia de giro en el motor para no bloquear futuros giros.
+  useEffect(() => {
+    if (!isOpen) {
+      clearSpinInterval();
+      setIsSpinning(false);
+      setDisplayedDrop(null);
+      setWonDrop(null);
+      onSpinResolved?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (isOpen && !wonDrop && !isSpinning && coins >= MYSTERY_BOX_COST) {
       // Iniciar giro automáticamente al abrir la caja si tiene monedas
       handleSpin();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   if (!isOpen) return null;
 
   const handleSpin = () => {
     if (coins < MYSTERY_BOX_COST || isSpinning) return;
+    // No iniciar un segundo giro concurrente si aún hay uno en curso.
+    if (spinIntervalRef.current !== null) return;
 
     setIsSpinning(true);
     setWonDrop(null);
 
-    const result = onSpin();
+    // El motor cobra y genera AHORA la recompensa definitiva. La animación
+    // solo representa visualmente el giro; nunca altera la lógica económica.
+    const result = onSpinRef.current();
     if (!result) {
       setIsSpinning(false);
       return;
@@ -66,19 +114,22 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
     const maxIterations = 28;
     const intervalTime = 70;
 
-    const interval = setInterval(() => {
+    spinIntervalRef.current = setInterval(() => {
       iterations++;
       sound.playBoxTick();
 
-      // Mostrar elemento aleatorio durante el giro
+      // Mostrar elemento aleatorio durante el giro (puro cosmético)
       const randomItem = MYSTERY_BOX_DROPS[Math.floor(Math.random() * MYSTERY_BOX_DROPS.length)];
-      setDisplayedDrop(randomItem);
+      if (mountedRef.current) setDisplayedDrop(randomItem);
 
       if (iterations >= maxIterations) {
-        clearInterval(interval);
+        clearSpinInterval();
+        if (!mountedRef.current) return;
+        // El resultado mostrado es EXACTAMENTE la recompensa generada por el motor.
         setDisplayedDrop(result);
         setWonDrop(result);
         setIsSpinning(false);
+        onSpinResolved?.();
 
         if (result.rarity === 'legendary') {
           sound.playLegendaryDrop();
@@ -89,9 +140,18 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
     }, intervalTime);
   };
 
+  const handleClose = () => {
+    clearSpinInterval();
+    onClose();
+  };
+
   const handleClaim = () => {
+    clearSpinInterval();
     if (wonDrop) {
       onClaimDrop(wonDrop);
+    } else {
+      // Cierre sin reclamar: liberar la pendencia de giro en el motor.
+      onSpinResolved?.();
     }
     onClose();
   };
@@ -266,7 +326,7 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
         {/* Acciones del Modal */}
         <div className="flex items-center justify-between gap-3 px-6 py-4 border-t border-neutral-800 bg-neutral-900/60">
           <button
-            onClick={onClose}
+            onClick={handleClose}
             disabled={isSpinning}
             className="px-4 py-2.5 rounded-xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 text-xs font-semibold text-neutral-300 transition-colors disabled:opacity-50 cursor-pointer"
           >

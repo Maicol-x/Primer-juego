@@ -14,7 +14,7 @@ import { BaseUpgradeModal } from './components/BaseUpgradeModal';
 import { GameOverModal } from './components/GameOverModal';
 import { PauseModal } from './components/PauseModal';
 import { SettingsModal } from './components/SettingsModal';
-import { getBaseUpgradeCost, getWeaponUpgradeCost, upgradeWeapon, rollMysteryBox } from './game/weapons';
+import { getBaseUpgradeCost, getWeaponUpgradeCost, upgradeWeapon } from './game/weapons';
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -85,7 +85,10 @@ export default function App() {
       },
       onNearMysteryBox: (near) => setIsNearBox(near),
       onNearWorkshop: (near) => setIsNearWorkshop(near),
-      onOpenMysteryBoxResult: () => {
+      onOpenMysteryBox: () => {
+        // El motor NO cobra aquí: solo notifica la interacción.
+        // El cobro y la generación de recompensa ocurren una única vez
+        // en requestMysterySpin() cuando el modal solicita el giro.
         setIsBoxModalOpen(true);
       },
       onCameraModeChange: (mode) => setCameraMode(mode),
@@ -191,19 +194,24 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [gameState, isSettingsOpen, isBoxModalOpen, isWorkshopModalOpen, handlePause, handleResume]);
 
-  // Abrir modal de Caja Misteriosa
+  // Abrir modal de Caja Misteriosa (la interacción física la notifica el motor
+  // vía onOpenMysteryBox; esta función queda para aperturas desde HUD/botón).
   const handleOpenMysteryBox = () => {
     if (!engineRef.current) return;
-    const opened = engineRef.current.openMysteryBox();
-    if (opened) {
-      setIsBoxModalOpen(true);
-    }
+    setIsBoxModalOpen(true);
   };
 
-  // Giro de la caja misteriosa
+  // Giro de la caja misteriosa: ÚNICA operación económica. El motor comprueba
+  // saldo, descuenta el coste una sola vez y genera UNA recompensa, que es la
+  // que se muestra en la interfaz (no una segunda tirada aleatoria).
   const handleSpinMysteryBox = (): MysteryBoxDrop | null => {
     if (!engineRef.current) return null;
-    return rollMysteryBox();
+    const drop = engineRef.current.requestMysterySpin();
+    if (drop) {
+      // Reflejar inmediatamente el saldo descontado en el HUD/modal.
+      setPlayerState({ ...engineRef.current.player });
+    }
+    return drop;
   };
 
   // Reclamar premio de la caja misteriosa
@@ -213,6 +221,17 @@ export default function App() {
     setPlayerState({ ...engineRef.current.player });
     setBaseState({ ...engineRef.current.base });
     setIsBoxModalOpen(false);
+  };
+
+  // Cierre del modal sin reclamar / animación terminada: libera el bloqueo de giro.
+  const handleMysterySpinResolved = () => {
+    engineRef.current?.resolveMysterySpin();
+  };
+
+  // Cierre explícito del modal (botón X / Escape): liberar spinPending también.
+  const handleCloseMysteryBox = () => {
+    setIsBoxModalOpen(false);
+    engineRef.current?.resolveMysterySpin();
   };
 
   // Cambiar arma activa
@@ -353,9 +372,10 @@ export default function App() {
       {playerState && (
         <MysteryBoxModal
           isOpen={isBoxModalOpen}
-          onClose={() => setIsBoxModalOpen(false)}
+          onClose={handleCloseMysteryBox}
           coins={playerState.coins}
           onSpin={handleSpinMysteryBox}
+          onSpinResolved={handleMysterySpinResolved}
           onClaimDrop={handleClaimDrop}
         />
       )}

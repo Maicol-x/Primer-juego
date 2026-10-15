@@ -8,7 +8,14 @@ import {
   MysteryBoxDrop,
   Weapon,
 } from '../types';
-import { createWeaponInstance, MYSTERY_BOX_COST, rollMysteryBox } from '../weapons';
+import {
+  createWeaponInstance,
+  MYSTERY_BOX_COST,
+  rollMysteryBox,
+  getWeaponUpgradeCost,
+  upgradeWeapon,
+  getBaseUpgradeCost,
+} from '../weapons';
 import { sound } from '../audio';
 import {
   createPlayerMesh,
@@ -85,7 +92,12 @@ export interface ThreeEngineCallbacks {
   onGameOver: (stats: { round: number; kills: number; score: number; coins: number }) => void;
   onNearMysteryBox: (isNear: boolean) => void;
   onNearWorkshop: (isNear: boolean) => void;
-  onOpenMysteryBoxResult: (drop: MysteryBoxDrop) => void;
+  /**
+   * Notifica a la interfaz que se debe ABRIR el modal de la Caja Misteriosa.
+   * El resultado del giro se solicita después vía requestMysterySpin() — que es
+   * la ÚNICA operación que cobra y genera recompensa (una sola vez por giro).
+   */
+  onOpenMysteryBox: () => void;
   onCameraModeChange?: (mode: CameraMode) => void;
   onDroneTelemetry?: (telemetry: { alt: number; x: number; z: number }) => void;
   onHitmarker?: () => void;
@@ -147,6 +159,26 @@ interface ZombieInstance {
   deathTimer?: number;
   deathVel?: THREE.Vector3;
   rotVel?: THREE.Vector3;
+}
+
+/**
+ * Distancia mínima (plano XZ) desde un punto P hasta el segmento AB.
+ * Usada para detección de colisiones barrida de proyectiles: un proyectil
+ * rápido que se mueve de A a B en un frame no debe atravesar un objetivo
+ * si el segmento pasa a menos de su radio efectivo del centro del mismo.
+ */
+export function distancePointToSegment(
+  px: number, pz: number,
+  ax: number, az: number,
+  bx: number, bz: number
+): number {
+  const abx = bx - ax;
+  const abz = bz - az;
+  const lenSq = abx * abx + abz * abz;
+  if (lenSq === 0) return Math.hypot(px - ax, pz - az);
+  let t = ((px - ax) * abx + (pz - az) * abz) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + abx * t), pz - (az + abz * t));
 }
 
 export class ThreeGameEngine {
@@ -236,10 +268,22 @@ export class ThreeGameEngine {
 
   private baseWeaponMountPos = new THREE.Vector3(0, 0.05, 0.15);
   private baseWeaponMountRot = new THREE.Euler(0, 0, 0);
+  // Postura base del viewmodel en primera persona, específica de cada arma.
+  // updatePlayerAnimations() aplica el sway como offset sobre esta posición,
+  // en lugar de sobrescribirla con valores genéricos (defecto corregido).
+  private baseFpViewPos = new THREE.Vector3(0.3, -0.28, -0.56);
   public isPointerLocked = false;
 
   private keys: Record<string, boolean> = {};
   private isMouseDown = false;
+
+  // Pendencia de giro de la Caja Misteriosa: true mientras la animación del
+  // modal está en curso. Impide cobros dobles por clics rápidos/concurrentes.
+  private spinPending = false;
+
+  // Timeouts pendientes del arco Tesla (limpieza visual diferida). Se cancelan
+  // en destroy() para evitar callbacks que toquen la escena tras destruirla.
+  private pendingTeslaTimeouts: Set<ReturnType<typeof setTimeout>> = new Set();
 
   private nextId = 1;
 
@@ -471,7 +515,8 @@ export class ThreeGameEngine {
       this.playerMeshObj.leftArm.rotation.set(-0.75, -0.38, 0.32);
 
       // En primera persona: el lanzacohetes ocupa la parte superior derecha de la pantalla
-      this.fpViewModel.group.position.set(0.34, -0.16, -0.44);
+      this.baseFpViewPos.set(0.34, -0.16, -0.44);
+      this.fpViewModel.group.position.copy(this.baseFpViewPos);
       this.fpViewModel.group.rotation.set(-0.05, 0, 0);
     } else if (w.id === 'vulcan') {
       // Minigun sostenida a la altura de la cadera (Terminator / GTA V heavy carry)
@@ -482,7 +527,8 @@ export class ThreeGameEngine {
       this.playerMeshObj.rightArm.rotation.set(0.35, 0.05, -0.05);
       this.playerMeshObj.leftArm.rotation.set(0.42, 0.25, -0.2);
 
-      this.fpViewModel.group.position.set(0.24, -0.38, -0.6);
+      this.baseFpViewPos.set(0.24, -0.38, -0.6);
+      this.fpViewModel.group.position.copy(this.baseFpViewPos);
       this.fpViewModel.group.rotation.set(0, 0, 0);
     } else if (w.id === 'pistol') {
       // Pistola táctica empuñada con agarre de combate
@@ -493,7 +539,8 @@ export class ThreeGameEngine {
       this.playerMeshObj.rightArm.rotation.set(0.16, 0, 0);
       this.playerMeshObj.leftArm.rotation.set(0.2, 0.26, 0);
 
-      this.fpViewModel.group.position.set(0.2, -0.24, -0.42);
+      this.baseFpViewPos.set(0.2, -0.24, -0.42);
+      this.fpViewModel.group.position.copy(this.baseFpViewPos);
       this.fpViewModel.group.rotation.set(0, 0, 0);
     } else if (w.category === 'shotgun') {
       // Escopeta táctica SPAS-12 con guardamanos
@@ -504,7 +551,8 @@ export class ThreeGameEngine {
       this.playerMeshObj.rightArm.rotation.set(0.06, 0, 0);
       this.playerMeshObj.leftArm.rotation.set(0.22, 0.28, -0.04);
 
-      this.fpViewModel.group.position.set(0.28, -0.26, -0.52);
+      this.baseFpViewPos.set(0.28, -0.26, -0.52);
+      this.fpViewModel.group.position.copy(this.baseFpViewPos);
       this.fpViewModel.group.rotation.set(0, 0, 0);
     } else {
       // Fusil de asalto M4A1, Subfusil Vector y Armas de Energía
@@ -515,7 +563,8 @@ export class ThreeGameEngine {
       this.playerMeshObj.rightArm.rotation.set(0, 0, 0);
       this.playerMeshObj.leftArm.rotation.set(0, 0, 0);
 
-      this.fpViewModel.group.position.set(0.3, -0.28, -0.56);
+      this.baseFpViewPos.set(0.3, -0.28, -0.56);
+      this.fpViewModel.group.position.copy(this.baseFpViewPos);
       this.fpViewModel.group.rotation.set(0, 0, 0);
     }
   }
@@ -954,6 +1003,68 @@ export class ThreeGameEngine {
   // BUCLE DE ACTUALIZACIÓN DEL JUEGO
   // --------------------------------------------------------------------------------
 
+  /** Envía una copia del estado del jugador a la interfaz (fuera del bucle de juego). */
+  public syncPlayerState() {
+    if (this.destroyed) return;
+    this.callbacks.onPlayerUpdate({ ...this.player });
+  }
+
+  /** Única operación de compra: comprueba saldo, descuenta y aplica. Idempotente por validación centralizada. */
+  public purchaseWeaponUpgrade(weaponIndex: number): boolean {
+    const p = this.player;
+    const w = p.weapons[weaponIndex];
+    if (!w || this.destroyed || this.gameOverTriggered) return false;
+    const cost = getWeaponUpgradeCost(w);
+    if (p.coins < cost || w.upgradeLevel >= w.maxUpgradeLevel) return false;
+    p.coins -= cost;
+    p.weapons[weaponIndex] = upgradeWeapon(w);
+    this.syncPlayerState();
+    return true;
+  }
+
+  public purchaseBaseRepair(): boolean {
+    const p = this.player;
+    const b = this.base;
+    if (this.destroyed || this.gameOverTriggered) return false;
+    const cost = getBaseUpgradeCost('repair', b);
+    if (p.coins < cost || b.hp >= b.maxHp) return false;
+    p.coins -= cost;
+    b.hp = b.maxHp;
+    this.syncPlayerState();
+    this.callbacks.onBaseUpdate({ ...b });
+    return true;
+  }
+
+  public purchaseBaseArmor(): boolean {
+    const p = this.player;
+    const b = this.base;
+    if (this.destroyed || this.gameOverTriggered) return false;
+    const cost = getBaseUpgradeCost('armor', b);
+    if (p.coins < cost) return false;
+    p.coins -= cost;
+    b.armorLevel++;
+    b.maxHp += 200;
+    b.hp = Math.min(b.maxHp, b.hp + 200);
+    this.syncPlayerState();
+    this.callbacks.onBaseUpdate({ ...b });
+    return true;
+  }
+
+  public purchaseBaseTurret(): boolean {
+    const p = this.player;
+    const b = this.base;
+    if (this.destroyed || this.gameOverTriggered) return false;
+    const cost = getBaseUpgradeCost('turret', b);
+    if (p.coins < cost) return false;
+    p.coins -= cost;
+    b.turretLevel++;
+    b.turretFireRate = Number((b.turretFireRate * 1.25).toFixed(2));
+    b.turretRange += 4;
+    this.syncPlayerState();
+    this.callbacks.onBaseUpdate({ ...b });
+    return true;
+  }
+
   private update(dt: number) {
     this.updatePlayer(dt);
     this.updateBase(dt);
@@ -1168,9 +1279,17 @@ export class ThreeGameEngine {
     }
 
     if (this.cameraMode === 'first-person') {
+      // Sway de locomoción: se aplica como OFFSET sobre la postura base del
+      // viewmodel específica de cada arma (baseFpViewPos), no sobrescribiendo
+      // una posición genérica fija. Así cada arma conserva su colocación
+      // intencionada (RPG al hombro, minigun a la cadera, etc.).
       const swayX = isMoving ? Math.sin(this.walkAnimTime) * 0.015 : 0;
       const swayY = isMoving ? Math.cos(this.walkAnimTime * 2) * 0.012 : 0;
-      this.fpViewModel.group.position.set(0.36 + swayX, -0.3 + swayY, -0.62);
+      this.fpViewModel.group.position.set(
+        this.baseFpViewPos.x + swayX,
+        this.baseFpViewPos.y + swayY,
+        this.baseFpViewPos.z
+      );
     }
 
     if (this.muzzleFlashLight.intensity > 0) {
@@ -1411,6 +1530,7 @@ export class ThreeGameEngine {
       }
 
       const step = proj.vel.clone().multiplyScalar(dt);
+      const prevPos = proj.pos.clone(); // origen del segmento barrido este frame
       proj.pos.add(step);
       proj.mesh.position.copy(proj.pos);
       proj.rangeRemaining -= step.length();
@@ -1471,12 +1591,19 @@ export class ThreeGameEngine {
       }
 
       let hit = false;
+      // Colisión barrida (segmento prevPos→pos vs. esfera del zombie): evita
+      // que proyectiles rápidos atraviesen enemigos entre fotogramas (tunneling).
       for (let j = this.zombies.length - 1; j >= 0; j--) {
         const z = this.zombies[j];
         if (z.isDying) continue;
 
-        const dist = Math.hypot(proj.pos.x - z.group.position.x, proj.pos.z - z.group.position.z);
-        if (dist < proj.radius + z.data.radius * 0.075) {
+        const effRadius = proj.radius + z.data.radius * 0.075;
+        const dist = distancePointToSegment(
+          z.group.position.x, z.group.position.z,
+          prevPos.x, prevPos.z,
+          proj.pos.x, proj.pos.z
+        );
+        if (dist < effRadius) {
           hit = true;
           this.damageZombie(z, proj.damage, proj.vel);
           this.callbacks.onHitmarker?.();
@@ -1673,11 +1800,14 @@ export class ThreeGameEngine {
         const line = new THREE.Line(lineGeo, lineMat);
         this.scene.add(line);
 
-        setTimeout(() => {
+        const timeoutId = setTimeout(() => {
+          this.pendingTeslaTimeouts.delete(timeoutId);
+          if (this.destroyed) return;
           this.scene.remove(line);
           lineGeo.dispose();
           lineMat.dispose();
         }, 110);
+        this.pendingTeslaTimeouts.add(timeoutId);
 
         current = next;
       } else {
@@ -1772,6 +1902,8 @@ export class ThreeGameEngine {
   }
 
   private damagePlayer(amount: number) {
+    // Tras la derrota no se aplica más daño (transición terminal única).
+    if (this.gameOverTriggered || this.destroyed) return;
     const p = this.player;
     if (p.invulnerableTimer > 0 || p.isDashing) return;
 
@@ -1789,6 +1921,7 @@ export class ThreeGameEngine {
   }
 
   private damageBase(amount: number) {
+    if (this.gameOverTriggered || this.destroyed) return;
     const b = this.base;
     sound.playBaseHurt();
     this.addCameraShake(8);
@@ -1803,8 +1936,27 @@ export class ThreeGameEngine {
     }
   }
 
+  /**
+   * Transición terminal IDEMPOTENTE: aunque varios zombies ataquen en el mismo
+   * frame o varias fuentes de daño concurrentes llamen a esta función, la
+   * notificación de derrota se emite exactamente una vez y el bucle se detiene.
+   */
   private triggerGameOver() {
+    if (this.gameOverTriggered || this.destroyed) return;
+    this.gameOverTriggered = true;
     this.isRunning = false;
+    this.spinPending = false;
+
+    if (this.animFrameId !== null) {
+      cancelAnimationFrame(this.animFrameId);
+      this.animFrameId = null;
+    }
+
+    // Soltar el puntero capturado para poder interactuar con la pantalla de derrota
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock?.();
+    }
+
     this.callbacks.onGameOver({
       round: this.round,
       kills: this.player.kills,
@@ -2291,25 +2443,42 @@ export class ThreeGameEngine {
     const pPos = this.playerMeshObj.group.position;
     const dstBox = Math.hypot(pPos.x - this.mysteryBox.x, pPos.z - this.mysteryBox.y);
     if (dstBox < 4.8) {
-      this.openMysteryBox();
+      // No cobrar aquí: el modal solicitará el giro vía requestMysterySpin(),
+      // que es la única operación que cobra y genera la recompensa (una vez).
+      // Así se evita el doble cobro (interact + apertura de modal).
+      this.callbacks.onOpenMysteryBox();
       return;
     }
   }
 
-  public openMysteryBox(): boolean {
-    if (this.player.coins < this.mysteryBox.cost) {
-      return false;
-    }
+  /**
+   * ÚNICA operación de giro de la Caja Misteriosa.
+   * Comprueba saldo, descuenta el precio exactamente una vez, genera UNA
+   * recompensa y la devuelve a la interfaz. Si no hay monedas suficientes,
+   * no gira ni consume dinero. Bloquea giros concurrentes mientras la
+   * animación del giro está en curso (spinPending) para impedir clics
+   * dobles/rapidísimos que produzcan cobros múltiples sin recompensa.
+   */
+  public requestMysterySpin(): MysteryBoxDrop | null {
+    if (this.destroyed || this.gameOverTriggered) return null;
+    if (this.spinPending) return null; // un giro visual a la vez
+    if (this.player.coins < this.mysteryBox.cost) return null;
 
     this.player.coins -= this.mysteryBox.cost;
+    this.spinPending = true;
     sound.playCoin();
+    this.syncPlayerState();
 
-    const drop = rollMysteryBox();
-    this.callbacks.onOpenMysteryBoxResult(drop);
-    return true;
+    return rollMysteryBox();
+  }
+
+  /** La UI llama esto cuando termina la animación del giro (o al cerrarse el modal). */
+  public resolveMysterySpin() {
+    this.spinPending = false;
   }
 
   public applyMysteryDrop(drop: MysteryBoxDrop) {
+    this.spinPending = false;
     if (drop.type === 'weapon' && drop.weaponTemplate && drop.weaponTemplate.id) {
       const weaponInstance = createWeaponInstance(drop.weaponTemplate.id);
       const existingIdx = this.player.weapons.findIndex((w) => w.id === weaponInstance.id);
