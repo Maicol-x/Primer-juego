@@ -29,9 +29,11 @@ interface MysteryBoxModalProps {
    * devuelve la recompensa REAL generada (o null si no puede girar).
    */
   onSpin: () => MysteryBoxDrop | null;
-  /** Notifica al motor que el giro terminó (o fue cancelado al cerrar). */
+  /** Notifica al motor que el animación terminó con premio visible. */
   onSpinResolved?: () => void;
   onClaimDrop: (drop: MysteryBoxDrop) => void;
+  /** Coste real del giro en el motor (para mostrarlo y validarlo correctamente). */
+  spinCost?: number;
 }
 
 export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
@@ -41,6 +43,7 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
   onSpin,
   onSpinResolved,
   onClaimDrop,
+  spinCost = MYSTERY_BOX_COST,
 }) => {
   const [isSpinning, setIsSpinning] = useState(false);
   const [displayedDrop, setDisplayedDrop] = useState<MysteryBoxDrop | null>(null);
@@ -70,21 +73,23 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
     };
   }, []);
 
-  // Al abrir/cerrar el modal reiniciamos el estado visual. El cierre también
-  // libera la pendencia de giro en el motor para no bloquear futuros giros.
+  // Al abrir/cerrar el modal reiniciamos el estado visual. El cierre NO llama
+  // aquí a onSpinResolved: si existía un premio pendiente, ese camino lo
+  // perdía sin reembolsar (cobrar sin entregar). La decisión de cerrar la
+  // transacción corresponde al padre (App), que cancela con reembolso o
+  // mantiene el premio según el estado real del motor.
   useEffect(() => {
     if (!isOpen) {
       clearSpinInterval();
       setIsSpinning(false);
       setDisplayedDrop(null);
       setWonDrop(null);
-      onSpinResolved?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   useEffect(() => {
-    if (isOpen && !wonDrop && !isSpinning && coins >= MYSTERY_BOX_COST) {
+    if (isOpen && !wonDrop && !isSpinning && coins >= spinCost) {
       // Iniciar giro automáticamente al abrir la caja si tiene monedas
       handleSpin();
     }
@@ -94,7 +99,7 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
   if (!isOpen) return null;
 
   const handleSpin = () => {
-    if (coins < MYSTERY_BOX_COST || isSpinning) return;
+    if (coins < spinCost || isSpinning) return;
     // No iniciar un segundo giro concurrente si aún hay uno en curso.
     if (spinIntervalRef.current !== null) return;
 
@@ -148,11 +153,13 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
   const handleClaim = () => {
     clearSpinInterval();
     if (wonDrop) {
+      // Reclamar el premio REAL registrado por el motor (applyMysteryDrop
+      // valida identidad y evita doble reclamación).
       onClaimDrop(wonDrop);
-    } else {
-      // Cierre sin reclamar: liberar la pendencia de giro en el motor.
-      onSpinResolved?.();
     }
+    // Sin premio visible: NO liberar nada aquí. El cierre lo gestiona onClose
+    // (App), que cancela con reembolso si el giro sigue pendiente. Así un
+    // premio ya pagado no puede perderse ni sustituirse en silencio.
     onClose();
   };
 
@@ -203,7 +210,7 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
                 Caja Misteriosa
               </h2>
               <p className="text-xs text-neutral-400">
-                Coste: <span className="font-mono-numbers text-amber-400 font-bold">{MYSTERY_BOX_COST} Monedas</span> · Saldo: <span className="font-mono-numbers text-neutral-200">{coins} 🪙</span>
+                Coste: <span className="font-mono-numbers text-amber-400 font-bold">{spinCost} Monedas</span> · Saldo: <span className="font-mono-numbers text-neutral-200">{coins} 🪙</span>
               </p>
             </div>
           </div>
@@ -337,11 +344,11 @@ export const MysteryBoxModal: React.FC<MysteryBoxModalProps> = ({
             {/* Botón para volver a girar si tiene fondos */}
             <button
               onClick={handleSpin}
-              disabled={isSpinning || coins < MYSTERY_BOX_COST}
+              disabled={isSpinning || coins < spinCost}
               className="px-4 py-2.5 rounded-xl border border-amber-600/50 bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 font-bold text-xs uppercase transition-all disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center gap-1.5"
             >
               <Sparkles size={14} />
-              Girar ({MYSTERY_BOX_COST} 🪙)
+              Girar ({spinCost} 🪙)
             </button>
 
             {/* Botón para reclamar y equipar */}
