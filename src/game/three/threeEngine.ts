@@ -30,6 +30,54 @@ import { createWeapon3DMesh, WeaponModelResult } from './weaponModels';
 
 export type CameraMode = 'third-person' | 'first-person' | 'drone';
 
+/**
+ * Conjuntos de recursos COMPARTIDOS (materiales/geometrías/texturas estáticos de
+ * MaterialLibrary y helpers de modelos). Nunca deben liberarse al eliminar
+ * entidades temporales, porque siguen en uso por otras mallas.
+ */
+const SHARED_MATERIALS: ReadonlySet<THREE.Material> = new Set(
+  Object.values(MaterialLibrary).filter((v): v is THREE.Material => v instanceof THREE.Material)
+);
+const SHARED_GEOMETRIES: ReadonlySet<THREE.BufferGeometry> = new Set(
+  Object.values(MaterialLibrary).filter((v): v is THREE.BufferGeometry => v instanceof THREE.BufferGeometry)
+);
+
+function disposeMaterialIfUnique(material: THREE.Material) {
+  if (SHARED_MATERIALS.has(material)) return;
+  const m = material as THREE.MeshStandardMaterial;
+  // Texturas propias del material (solo si no están compartidas)
+  for (const tex of [m.map, m.roughnessMap, m.metalnessMap, m.emissiveMap]) {
+    if (tex && !SHARED_TEXTURES.has(tex)) tex.dispose();
+  }
+  material.dispose();
+}
+
+const SHARED_TEXTURES: ReadonlySet<THREE.Texture> = new Set(
+  [...SHARED_MATERIALS].flatMap((mat) => {
+    const m = mat as THREE.MeshStandardMaterial;
+    return [m.map, m.roughnessMap, m.metalnessMap, m.emissiveMap].filter(
+      (t): t is THREE.Texture => !!t
+    );
+  })
+);
+
+/**
+ * Libera los recursos EXCLUSIVOS de una malla/línea/punto concreta.
+ * Respeta los recursos compartidos registrados arriba.
+ */
+function disposeUniqueMeshResources(object: THREE.Object3D) {
+  const mesh = object as THREE.Mesh;
+  if (mesh.geometry && !SHARED_GEOMETRIES.has(mesh.geometry)) {
+    mesh.geometry.dispose();
+  }
+  const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+  if (Array.isArray(material)) {
+    material.forEach(disposeMaterialIfUnique);
+  } else if (material) {
+    disposeMaterialIfUnique(material);
+  }
+}
+
 export interface ThreeEngineCallbacks {
   onPlayerUpdate: (player: Player) => void;
   onBaseUpdate: (base: DefenseBase) => void;
@@ -71,6 +119,10 @@ interface Particle3D {
   decay: number;
   gravity?: number;
   bounces?: boolean;
+  // true => la geometría/material son exclusivos de esta partícula y deben liberarse
+  // al eliminarla. false => recurso compartido (MaterialLibrary, embers atmosféricos)
+  // que NO debe destruirse porque sigue en uso.
+  ownsResources?: boolean;
 }
 
 interface ShellCasing3D {
@@ -109,6 +161,15 @@ export class ThreeGameEngine {
   public isRunning = false;
   public isPaused = false;
   private animFrameId: number | null = null;
+  private destroyed = false;
+  private gameOverTriggered = false;
+  // Registro de listeners para poder retirarlos exactamente en destroy()
+  private boundListeners: Array<{
+    target: EventTarget;
+    type: string;
+    listener: EventListenerOrEventListenerObject;
+    options?: AddEventListenerOptions;
+  }> = [];
 
   // Modos de Cámara & Control Suave
   public cameraMode: CameraMode = 'third-person';
@@ -613,59 +674,73 @@ export class ThreeGameEngine {
   // --------------------------------------------------------------------------------
 
   private bindEvents() {
-    window.addEventListener('resize', this.onWindowResize);
+    // Helper: registra y memoriza cada listener para poder retirarlo en destroy()
+    const listen = (
+      target: EventTarget,
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: AddEventListenerOptions
+    ) => {
+      target.addEventListener(type, listener, options);
+      this.boundListeners.push({ target, type, listener, options });
+    };
 
-    window.addEventListener('keydown', (e) => {
-      this.keys[e.key.toLowerCase()] = true;
-      this.keys[e.code] = true;
+    listen(window, 'resize', this.onWindowResize);
+
+    listen(window, 'keydown', (e) => {
+      const ke = e as KeyboardEvent;
+      this.keys[ke.key.toLowerCase()] = true;
+      this.keys[ke.code] = true;
 
       // Tecla Escape para pausar y abrir el menú
-      if (e.key === 'Escape' || e.key === 'Esc') {
+      if (ke.key === 'Escape' || ke.key === 'Esc') {
         this.callbacks.onPauseRequest?.();
       }
 
       // Alternar cámaras con C o V
-      if (e.key.toLowerCase() === 'c' || e.key.toLowerCase() === 'v') {
+      if (ke.key.toLowerCase() === 'c' || ke.key.toLowerCase() === 'v') {
         this.cycleCameraMode();
       }
 
-      if (e.key.toLowerCase() === 'r') {
+      if (ke.key.toLowerCase() === 'r') {
         this.startReload();
       }
-      if (e.key === ' ' || e.code === 'Space') {
+      if (ke.key === ' ' || ke.code === 'Space') {
         if (this.cameraMode !== 'drone') {
           this.performDash();
         }
       }
-      if (e.key.toLowerCase() === 'e') {
+      if (ke.key.toLowerCase() === 'e') {
         this.interact();
       }
-      if (e.key >= '1' && e.key <= '5') {
-        const idx = parseInt(e.key) - 1;
+      if (ke.key >= '1' && ke.key <= '5') {
+        const idx = parseInt(ke.key) - 1;
         if (idx < this.player.weapons.length) {
           this.switchWeapon(idx);
         }
       }
     });
 
-    window.addEventListener('keyup', (e) => {
-      this.keys[e.key.toLowerCase()] = false;
-      this.keys[e.code] = false;
+    listen(window, 'keyup', (e) => {
+      const ke = e as KeyboardEvent;
+      this.keys[ke.key.toLowerCase()] = false;
+      this.keys[ke.code] = false;
     });
 
-    window.addEventListener('blur', () => {
+    listen(window, 'blur', () => {
       this.keys = {};
       this.isMouseDown = false;
     });
 
     // Fijación de puntero (Pointer Lock): Al hacer clic en el juego se captura el ratón
-    this.renderer.domElement.addEventListener('click', () => {
+    listen(this.renderer.domElement, 'click', () => {
       if (!document.pointerLockElement) {
         this.renderer.domElement.requestPointerLock?.();
       }
     });
 
-    document.addEventListener('pointerlockchange', () => {
+    listen(document, 'pointerlockchange', () => {
+      if (this.destroyed) return;
       this.isPointerLocked = document.pointerLockElement === this.renderer.domElement;
       this.callbacks.onPointerLockChange?.(this.isPointerLocked);
     });
@@ -675,17 +750,18 @@ export class ThreeGameEngine {
     // Mover ratón a la izquierda (dx < 0) -> Gira la vista y el personaje a la IZQUIERDA
     // Mover ratón hacia arriba (dy < 0) -> Mira hacia ARRIBA
     // Mover ratón hacia abajo (dy > 0) -> Mira hacia ABAJO
-    this.renderer.domElement.addEventListener('mousemove', (e) => {
+    listen(this.renderer.domElement, 'mousemove', (e) => {
+      const me = e as MouseEvent;
       const isLocked = document.pointerLockElement === this.renderer.domElement;
-      let dx = e.movementX;
-      let dy = e.movementY;
+      let dx = me.movementX;
+      let dy = me.movementY;
 
       if (!isLocked || dx === undefined || dy === undefined) {
-        dx = e.clientX - this.lastMousePos.x;
-        dy = e.clientY - this.lastMousePos.y;
+        dx = me.clientX - this.lastMousePos.x;
+        dy = me.clientY - this.lastMousePos.y;
       }
 
-      this.lastMousePos = { x: e.clientX, y: e.clientY };
+      this.lastMousePos = { x: me.clientX, y: me.clientY };
 
       // Filtrar saltos bruscos
       dx = THREE.MathUtils.clamp(dx, -60, 60);
@@ -709,30 +785,35 @@ export class ThreeGameEngine {
       }
     });
 
-    this.renderer.domElement.addEventListener('mousedown', (e) => {
-      this.lastMousePos = { x: e.clientX, y: e.clientY };
+    listen(this.renderer.domElement, 'mousedown', (e) => {
+      const me = e as MouseEvent;
+      this.lastMousePos = { x: me.clientX, y: me.clientY };
 
-      if (e.button === 0) {
+      if (me.button === 0) {
         this.isMouseDown = true;
-      } else if (e.button === 2) {
+      } else if (me.button === 2) {
         if (this.cameraMode !== 'drone') {
           this.performDash();
         }
       }
     });
 
-    this.renderer.domElement.addEventListener('mouseup', (e) => {
-      if (e.button === 0) {
+    // mouseup también en window: si el usuario suelta el botón fuera del canvas,
+    // el estado de disparo no debe quedar "pegado"
+    listen(window, 'mouseup', (e) => {
+      const me = e as MouseEvent;
+      if (me.button === 0) {
         this.isMouseDown = false;
       }
     });
 
-    this.renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+    listen(this.renderer.domElement, 'contextmenu', (e) => e.preventDefault());
 
-    this.renderer.domElement.addEventListener('wheel', (e) => {
-      if (e.deltaY > 0) {
+    listen(this.renderer.domElement, 'wheel', (e) => {
+      const we = e as WheelEvent;
+      if (we.deltaY > 0) {
         this.switchWeapon((this.player.activeWeaponIndex + 1) % this.player.weapons.length);
-      } else if (e.deltaY < 0) {
+      } else if (we.deltaY < 0) {
         this.switchWeapon(
           (this.player.activeWeaponIndex - 1 + this.player.weapons.length) % this.player.weapons.length
         );
@@ -749,6 +830,9 @@ export class ThreeGameEngine {
   };
 
   public start() {
+    if (this.destroyed || this.gameOverTriggered) return;
+    // Evita encolar múltiples bucles rAF si start() se llama repetidamente
+    if (this.isRunning) return;
     this.isRunning = true;
     this.isPaused = false;
     this.clock.start();
@@ -758,23 +842,93 @@ export class ThreeGameEngine {
 
   public pause() {
     this.isPaused = true;
+    // Suelta el puntero capturado para poder interactuar con los menús
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock?.();
+    }
   }
 
   public resume() {
+    if (this.destroyed || this.gameOverTriggered) return;
     if (this.isPaused) {
       this.isPaused = false;
       this.clock.start();
-      this.animate();
+      // El bucle puede seguir vivo durante la pausa (solo renderiza); si no lo está,
+      // se reencola aquí. Nunca se duplica porque animate() gestiona animFrameId.
+      if (!this.isRunning) {
+        this.isRunning = true;
+        this.animate();
+      }
     }
   }
 
   public destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
     this.isRunning = false;
-    if (this.animFrameId) {
+    this.isPaused = true;
+
+    if (this.animFrameId !== null) {
       cancelAnimationFrame(this.animFrameId);
+      this.animFrameId = null;
     }
-    window.removeEventListener('resize', this.onWindowResize);
+
+    // Retirar TODOS los listeners registrados (ventana, documento y canvas)
+    for (const { target, type, listener, options } of this.boundListeners) {
+      target.removeEventListener(type, listener, options);
+    }
+    this.boundListeners = [];
+
+    // Pendientes de Tesla: referencias a this.scene ya no válidas tras destroy
+    this.pendingTeslaTimeouts.forEach(clearTimeout);
+    this.pendingTeslaTimeouts.clear();
+
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock?.();
+    }
+
+    // Liberar recursos GPU de todas las entidades y efectos vivos
+    this.disposeObject3D(this.scene, /* recursive */ true);
+
+    // Libera los clones exclusivos de los viewmodels de arma (los originales
+    // permanecen en currentWeapon3D/currentFpWeapon3D y se liberan abajo).
+    this.playerMeshObj.weaponMount.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.geometry) mesh.geometry.dispose();
+    });
+
+    // Modelos de armas actuales (geometrías/materiales propios + clonados)
+    this.currentWeapon3D?.group.traverse(disposeUniqueMeshResources);
+    this.currentFpWeapon3D?.group.traverse(disposeUniqueMeshResources);
+
+    // Texturas exclusivas del suelo y quemaduras/plasma
+    this.scene.traverse(() => {}); // no-op defensivo
+
     this.renderer.dispose();
+    this.renderer.forceContextLoss?.();
+
+    if (this.renderer.domElement.parentElement === this.container) {
+      this.container.removeChild(this.renderer.domElement);
+    }
+
+    // Desvincular referencias grandes
+    this.zombies = [];
+    this.projectiles = [];
+    this.particles = [];
+    this.casings = [];
+    this.bloodDecals = [];
+  }
+
+  /** Elimina un Object3D del árbol y libera geometría/material/texturas exclusivos. */
+  private removeAndDispose(object: THREE.Object3D) {
+    object.removeFromParent();
+    disposeUniqueMeshResources(object);
+    object.traverse(disposeUniqueMeshResources);
+  }
+
+  /** Recorre un árbol y libera recursos de todos sus nodos (sin tocar compartidos). */
+  private disposeObject3D(root: THREE.Object3D, _recursive: boolean) {
+    root.traverse(disposeUniqueMeshResources);
   }
 
   private animate = () => {
