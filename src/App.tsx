@@ -14,7 +14,6 @@ import { BaseUpgradeModal } from './components/BaseUpgradeModal';
 import { GameOverModal } from './components/GameOverModal';
 import { PauseModal } from './components/PauseModal';
 import { SettingsModal } from './components/SettingsModal';
-import { getBaseUpgradeCost, getWeaponUpgradeCost, upgradeWeapon } from './game/weapons';
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -33,6 +32,8 @@ export default function App() {
   const [droneTelemetry, setDroneTelemetry] = useState<{ alt: number; x: number; z: number } | undefined>();
   const [targetLocked, setTargetLocked] = useState(false);
   const [isHitmarker, setIsHitmarker] = useState(false);
+  // Referencia al timeout del hitmarker para cancelarlo al desmontar/reiniciar.
+  const hitmarkerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
 
   // Estados reactivos sincronizados desde el motor 3D
@@ -96,7 +97,13 @@ export default function App() {
       onTargetLock: (locked) => setTargetLocked(locked),
       onHitmarker: () => {
         setIsHitmarker(true);
-        setTimeout(() => setIsHitmarker(false), 140);
+        // Timer controlado: se cancela al desmontar para no actualizar estado
+        // después del unmount (y evita acumular timeouts en ráfagas de impactos).
+        if (hitmarkerTimerRef.current !== null) clearTimeout(hitmarkerTimerRef.current);
+        hitmarkerTimerRef.current = setTimeout(() => {
+          hitmarkerTimerRef.current = null;
+          setIsHitmarker(false);
+        }, 140);
       },
       onPauseRequest: () => {
         if (engineRef.current && !engineRef.current.isPaused) {
@@ -180,7 +187,9 @@ export default function App() {
         if (isSettingsOpen) {
           setIsSettingsOpen(false);
         } else if (isBoxModalOpen) {
-          setIsBoxModalOpen(false);
+          // Cierre con Escape: misma ruta que el botón X → cancelación con
+          // reembolso centralizado si el giro aún no entregó su premio.
+          handleCloseMysteryBox();
         } else if (isWorkshopModalOpen) {
           setIsWorkshopModalOpen(false);
         } else if (gameState === 'PLAYING') {
@@ -192,7 +201,15 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [gameState, isSettingsOpen, isBoxModalOpen, isWorkshopModalOpen, handlePause, handleResume]);
+  }, [gameState, isSettingsOpen, isBoxModalOpen, isWorkshopModalOpen, handlePause, handleResume, handleCloseMysteryBox]);
+
+  // Limpieza al desmontar App: cancelar timers de UI pendientes para no
+  // actualizar estado después del unmount.
+  useEffect(() => {
+    return () => {
+      if (hitmarkerTimerRef.current !== null) clearTimeout(hitmarkerTimerRef.current);
+    };
+  }, []);
 
   // Abrir modal de Caja Misteriosa (la interacción física la notifica el motor
   // vía onOpenMysteryBox; esta función queda para aperturas desde HUD/botón).
@@ -223,15 +240,33 @@ export default function App() {
     setIsBoxModalOpen(false);
   };
 
-  // Cierre del modal sin reclamar / animación terminada: libera el bloqueo de giro.
+  // Animación terminada (premio visible): intenta pasar a "pendiente de reclamar".
+  // El motor solo libera el bloqueo si NO existe un premio pendiente, por lo que
+  // esta llamada es segura incluso si el modal ya obtuvo su drop.
   const handleMysterySpinResolved = () => {
     engineRef.current?.resolveMysterySpin();
   };
 
-  // Cierre explícito del modal (botón X / Escape): liberar spinPending también.
+  // Cierre explícito del modal (botón X / Escape) con giro en curso y premio
+  // aún NO reclamado: transacción cancelada → reembolso centralizado en el
+  // motor (sin doble devolución). Si ya hay premio pendiente de reclamar,
+  // se aplica automáticamente antes de cerrar: un premio pagado nunca se
+  // pierde por cerrar la ventana. El orden es crítico: applyMysteryDrop
+  // consume pendingDrop y libera spinPending, de modo que el posterior
+  // cancelMysterySpin no encuentra giro pendiente y no devuelve dinero.
   const handleCloseMysteryBox = () => {
+    const engine = engineRef.current;
+    if (engine) {
+      const pending = engine.getPendingMysteryDrop();
+      if (pending) {
+        engine.applyMysteryDrop(pending);
+      } else {
+        engine.cancelMysterySpin(engine.getMysteryBoxCost());
+      }
+      setPlayerState({ ...engine.player });
+      setBaseState({ ...engine.base });
+    }
     setIsBoxModalOpen(false);
-    engineRef.current?.resolveMysterySpin();
   };
 
   // Cambiar arma activa
@@ -241,68 +276,40 @@ export default function App() {
     setPlayerState({ ...engineRef.current.player });
   };
 
-  // Mejorar arma en taller
+  // Mejorar arma en taller → DELEGADO AL MOTOR (única autoridad económica:
+  // valida saldo, límite de mejoras y estado terminal; descuenta una sola vez).
   const handleUpgradeWeapon = (weaponIndex: number) => {
-    if (!engineRef.current) return;
-    const p = engineRef.current.player;
-    const w = p.weapons[weaponIndex];
-    if (!w) return;
-
-    const cost = getWeaponUpgradeCost(w);
-    if (p.coins >= cost && w.upgradeLevel < w.maxUpgradeLevel) {
-      p.coins -= cost;
-      p.weapons[weaponIndex] = upgradeWeapon(w);
-      setPlayerState({ ...p });
-    }
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.purchaseWeaponUpgrade(weaponIndex);
+    setPlayerState({ ...engine.player });
   };
 
-  // Reparar base
+  // Reparar base → delegado al motor
   const handleRepairBase = () => {
-    if (!engineRef.current) return;
-    const p = engineRef.current.player;
-    const b = engineRef.current.base;
-    const cost = getBaseUpgradeCost('repair', b);
-
-    if (p.coins >= cost && b.hp < b.maxHp) {
-      p.coins -= cost;
-      b.hp = b.maxHp;
-      setPlayerState({ ...p });
-      setBaseState({ ...b });
-    }
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.purchaseBaseRepair();
+    setPlayerState({ ...engine.player });
+    setBaseState({ ...engine.base });
   };
 
-  // Mejorar blindaje base
+  // Mejorar blindaje base → delegado al motor
   const handleUpgradeBaseArmor = () => {
-    if (!engineRef.current) return;
-    const p = engineRef.current.player;
-    const b = engineRef.current.base;
-    const cost = getBaseUpgradeCost('armor', b);
-
-    if (p.coins >= cost) {
-      p.coins -= cost;
-      b.armorLevel++;
-      b.maxHp += 200;
-      b.hp = Math.min(b.maxHp, b.hp + 200);
-      setPlayerState({ ...p });
-      setBaseState({ ...b });
-    }
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.purchaseBaseArmor();
+    setPlayerState({ ...engine.player });
+    setBaseState({ ...engine.base });
   };
 
-  // Mejorar torreta base
+  // Mejorar torreta base → delegado al motor
   const handleUpgradeBaseTurret = () => {
-    if (!engineRef.current) return;
-    const p = engineRef.current.player;
-    const b = engineRef.current.base;
-    const cost = getBaseUpgradeCost('turret', b);
-
-    if (p.coins >= cost) {
-      p.coins -= cost;
-      b.turretLevel++;
-      b.turretFireRate = Number((b.turretFireRate * 1.25).toFixed(2));
-      b.turretRange += 4;
-      setPlayerState({ ...p });
-      setBaseState({ ...b });
-    }
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.purchaseBaseTurret();
+    setPlayerState({ ...engine.player });
+    setBaseState({ ...engine.base });
   };
 
   return (
@@ -374,6 +381,7 @@ export default function App() {
           isOpen={isBoxModalOpen}
           onClose={handleCloseMysteryBox}
           coins={playerState.coins}
+          spinCost={engineRef.current?.getMysteryBoxCost()}
           onSpin={handleSpinMysteryBox}
           onSpinResolved={handleMysterySpinResolved}
           onClaimDrop={handleClaimDrop}

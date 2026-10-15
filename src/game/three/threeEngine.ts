@@ -2616,6 +2616,17 @@ export class ThreeGameEngine {
     return this.mysteryBox.cost;
   }
 
+  /**
+   * Premio pagado y generado por el motor que aún no ha sido reclamado.
+   * La UI lo usa al cerrar el modal para aplicarlo en lugar de perderlo.
+   * Solo devuelve el objeto registrado internamente: la interfaz no puede
+   * fabricar drops alternativos.
+   */
+  public getPendingMysteryDrop(): MysteryBoxDrop | null {
+    if (this.destroyed || this.gameOverTriggered) return null;
+    return this.pendingDrop;
+  }
+
   public applyMysteryDrop(drop: MysteryBoxDrop) {
     // Protección terminal equivalente a requestMysterySpin(): tras GAME_OVER o
     // destroy no se aplica ninguna recompensa (y se libera el bloqueo para no
