@@ -98,6 +98,8 @@ export interface ThreeEngineCallbacks {
    * la ÚNICA operación que cobra y genera recompensa (una sola vez por giro).
    */
   onOpenMysteryBox: () => void;
+  /** La tecla E cerca del taller solicita abrir el modal de mejoras (simétrico con la caja). */
+  onOpenWorkshop?: () => void;
   onCameraModeChange?: (mode: CameraMode) => void;
   onDroneTelemetry?: (telemetry: { alt: number; x: number; z: number }) => void;
   onHitmarker?: () => void;
@@ -135,6 +137,9 @@ interface Particle3D {
   // al eliminarla. false => recurso compartido (MaterialLibrary, embers atmosféricos)
   // que NO debe destruirse porque sigue en uso.
   ownsResources?: boolean;
+  // Material COMPARTIDO (embers atmosféricos, MaterialLibrary) usado por esta
+  // partícula: se libera su geometría al expirar pero NUNCA este material.
+  sharedMaterial?: THREE.Material;
 }
 
 interface ShellCasing3D {
@@ -193,6 +198,7 @@ export class ThreeGameEngine {
   public isRunning = false;
   public isPaused = false;
   private animFrameId: number | null = null;
+  private envTexture: THREE.Texture | null = null;
   private destroyed = false;
   private gameOverTriggered = false;
   // Registro de listeners para poder retirarlos exactamente en destroy()
@@ -280,6 +286,8 @@ export class ThreeGameEngine {
   // Pendencia de giro de la Caja Misteriosa: true mientras la animación del
   // modal está en curso. Impide cobros dobles por clics rápidos/concurrentes.
   private spinPending = false;
+  /** Recompensa generada por requestMysterySpin() aún no reclamada por la UI. */
+  private pendingDrop: MysteryBoxDrop | null = null;
 
   // Timeouts pendientes del arco Tesla (limpieza visual diferida). Se cancelan
   // en destroy() para evitar callbacks que toquen la escena tras destruirla.
@@ -372,7 +380,10 @@ export class ThreeGameEngine {
     this.scene.fog = new THREE.FogExp2(0x060913, 0.014);
 
     const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
-    this.scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    // Guardamos la textura de entorno para poder liberarla en destroy():
+    // sin esto, cada motor creado/acumulado deja un render target GPU vivo.
+    this.envTexture = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    this.scene.environment = this.envTexture;
     pmremGenerator.dispose();
 
     // 4. Cámara Perspectiva
@@ -714,6 +725,7 @@ export class ThreeGameEngine {
         vel: new THREE.Vector3((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.3, (Math.random() - 0.5) * 0.5),
         alpha: 0.5,
         decay: 0.02,
+        sharedMaterial: emberMat,
       });
     }
   }
@@ -738,13 +750,21 @@ export class ThreeGameEngine {
 
     listen(window, 'keydown', (e) => {
       const ke = e as KeyboardEvent;
-      this.keys[ke.key.toLowerCase()] = true;
-      this.keys[ke.code] = true;
 
-      // Tecla Escape para pausar y abrir el menú
+      // Escape siempre disponible: pausar/reanudar desde el menú de pausa.
       if (ke.key === 'Escape' || ke.key === 'Esc') {
         this.callbacks.onPauseRequest?.();
+        return;
       }
+
+      // MÁQUINA DE ESTADOS DE ENTRADA: mientras la partida no esté activa
+      // (pausada o en derrota) NO se procesan acciones de juego: cambiar
+      // armas, recargar, dash ni interacciones. Solo queda Escape arriba.
+      // Esto evita que teclas pulsadas bajo un modal alteren el motor.
+      if (!this.isRunning || this.isPaused || this.gameOverTriggered) return;
+
+      this.keys[ke.key.toLowerCase()] = true;
+      this.keys[ke.code] = true;
 
       // Alternar cámaras con C o V
       if (ke.key.toLowerCase() === 'c' || ke.key.toLowerCase() === 'v') {
@@ -891,6 +911,15 @@ export class ThreeGameEngine {
 
   public pause() {
     this.isPaused = true;
+    // Durante la pausa el bucle NO debe quedar congelado con isRunning=true:
+    // se cancela el fotograma pendiente y se marca isRunning=false para que
+    // resume() pueda relanzar un único bucle. Esto elimina el congelamiento
+    // al reanudar (animate() salía sin re-encolar cuando estaba pausado).
+    if (this.animFrameId !== null) {
+      cancelAnimationFrame(this.animFrameId);
+      this.animFrameId = null;
+    }
+    this.isRunning = false;
     // Suelta el puntero capturado para poder interactuar con los menús
     if (document.pointerLockElement === this.renderer.domElement) {
       document.exitPointerLock?.();
@@ -902,12 +931,9 @@ export class ThreeGameEngine {
     if (this.isPaused) {
       this.isPaused = false;
       this.clock.start();
-      // El bucle puede seguir vivo durante la pausa (solo renderiza); si no lo está,
-      // se reencola aquí. Nunca se duplica porque animate() gestiona animFrameId.
-      if (!this.isRunning) {
-        this.isRunning = true;
-        this.animate();
-      }
+      // Relanza SIEMPRE un único bucle: start() es idempotente mientras
+      // isRunning sea true, por lo que no pueden coexistir dos bucles rAF.
+      this.start();
     }
   }
 
@@ -916,6 +942,12 @@ export class ThreeGameEngine {
     this.destroyed = true;
     this.isRunning = false;
     this.isPaused = true;
+
+    // Si había un giro pagado sin reclamar, el premio se pierde al destruir
+    // el motor: liberamos la pendencia para que ningún callback posterior de
+    // la UI intente aplicar/reclamar algo sobre un motor muerto.
+    this.spinPending = false;
+    this.pendingDrop = null;
 
     if (this.animFrameId !== null) {
       cancelAnimationFrame(this.animFrameId);
@@ -956,6 +988,14 @@ export class ThreeGameEngine {
     this.renderer.dispose();
     this.renderer.forceContextLoss?.();
 
+    // Textura HDR de entorno generada por PMREM: es exclusiva de este motor;
+    // liberarla evita dejar un render target GPU vivo tras cada destroy.
+    if (this.envTexture) {
+      this.scene.environment = null;
+      this.envTexture.dispose();
+      this.envTexture = null;
+    }
+
     if (this.renderer.domElement.parentElement === this.container) {
       this.container.removeChild(this.renderer.domElement);
     }
@@ -973,6 +1013,27 @@ export class ThreeGameEngine {
     object.removeFromParent();
     disposeUniqueMeshResources(object);
     object.traverse(disposeUniqueMeshResources);
+  }
+
+  /**
+   * Política común de eliminación de efectos temporales (proyectiles, casquillos,
+   * partículas): retira el objeto de la escena y libera SU geometría exclusiva.
+   * El material se pasa por parámetro porque puede ser compartido
+   * (MaterialLibrary / embers atmosféricos) y no debe destruirse nunca aquí;
+   * disposeMaterialIfUnique lo ignora si está en el conjunto compartido.
+   */
+  private removeEffectMesh(mesh: THREE.Mesh | THREE.Line, material?: THREE.Material | THREE.Material[]) {
+    mesh.removeFromParent();
+    const m = mesh as THREE.Mesh;
+    if (m.geometry && !SHARED_GEOMETRIES.has(m.geometry)) {
+      m.geometry.dispose();
+    }
+    const mat = material ?? (m.material as THREE.Material | THREE.Material[] | undefined);
+    if (Array.isArray(mat)) {
+      mat.forEach(disposeMaterialIfUnique);
+    } else if (mat) {
+      disposeMaterialIfUnique(mat);
+    }
   }
 
   /** Recorre un árbol y libera recursos de todos sus nodos (sin tocar compartidos). */
@@ -1066,16 +1127,25 @@ export class ThreeGameEngine {
   }
 
   private update(dt: number) {
-    this.updatePlayer(dt);
-    this.updateBase(dt);
-    this.updateZombies(dt);
-    this.updateProjectiles(dt);
-    this.updateCasings(dt);
-    this.updateParticles(dt);
-    this.updateRounds(dt);
-    this.updateProximity();
-    this.updateMysteryBoxAnimation(dt);
-    this.updateCamera(dt);
+    // Si la derrota se dispara en mitad del frame (p. ej. dentro de
+    // updateZombies al atacar varios zombis), se CORTA la actualización
+    // inmediatamente: ningún subsistema posterior puede seguir modificando
+    // monedas, puntuación, bajas o entidades después del estado terminal.
+    const step = (fn: (dt: number) => void) => {
+      if (this.gameOverTriggered || this.destroyed) return;
+      fn.call(this, dt);
+    };
+
+    step(this.updatePlayer);
+    step(this.updateBase);
+    step(this.updateZombies);
+    step(this.updateProjectiles);
+    step(this.updateCasings);
+    step(this.updateParticles);
+    step(this.updateRounds);
+    step(this.updateProximity);
+    step(this.updateMysteryBoxAnimation);
+    step(this.updateCamera);
   }
 
   private updatePlayer(dt: number) {
@@ -1509,7 +1579,9 @@ export class ThreeGameEngine {
       c.mesh.position.copy(c.pos);
 
       if (c.lifetime <= 0) {
-        this.scene.remove(c.mesh);
+        // Geometría del casquillo es exclusiva; el latón es material
+        // compartido de MaterialLibrary y no debe destruirse.
+        this.removeEffectMesh(c.mesh, MaterialLibrary.brassCasingMat);
         this.casings.splice(i, 1);
       }
     }
@@ -1640,7 +1712,14 @@ export class ThreeGameEngine {
 
   private destroyProjectile(index: number) {
     if (index >= 0 && index < this.projectiles.length) {
-      this.scene.remove(this.projectiles[index].mesh);
+      const proj = this.projectiles[index];
+      // Los proyectiles crean geometrías/materiales exclusivos por disparo:
+      // liberarlos aquí evita acumulación de recursos GPU en sesiones largas.
+      if (proj.mesh instanceof THREE.Mesh) {
+        this.removeEffectMesh(proj.mesh);
+      } else {
+        this.removeAndDispose(proj.mesh);
+      }
       this.projectiles.splice(index, 1);
     }
   }
@@ -1817,6 +1896,10 @@ export class ThreeGameEngine {
   }
 
   private damageZombie(z: ZombieInstance, amount: number, vel: THREE.Vector3) {
+    // Un zombi ya en animación de muerte no vuelve a recibir daño ni emite
+    // efectos (evita doble recompensa/efectos si dos proyectiles o una
+    // explosión lo alcanzan en el mismo frame tras morir).
+    if (z.isDying || this.gameOverTriggered || this.destroyed) return;
     sound.playZombieHit();
     z.data.hp -= amount;
 
@@ -1841,7 +1924,9 @@ export class ThreeGameEngine {
 
     if (this.bloodDecals.length > 70) {
       const old = this.bloodDecals.shift();
-      if (old) this.scene.remove(old);
+      // Cada mancha tiene geometría propia (radio aleatorio) y las quemaduras
+      // llevan material/textura exclusivos: liberar al desalojar.
+      if (old) this.removeEffectMesh(old);
     }
 
     const bloodGeo = new THREE.CircleGeometry(0.85 + Math.random() * 0.6, 12);
@@ -1895,7 +1980,9 @@ export class ThreeGameEngine {
 
       p.alpha -= p.decay * dt;
       if (p.alpha <= 0) {
-        this.scene.remove(p.mesh);
+        // Liberar la geometría exclusiva de la partícula al expirar. El
+        // material solo se destruye si era exclusivo (no compartido).
+        this.removeEffectMesh(p.mesh, p.sharedMaterial);
         this.particles.splice(i, 1);
       }
     }
@@ -2041,7 +2128,10 @@ export class ThreeGameEngine {
         z.group.rotation.z += z.rotVel.z * dt;
 
         if (z.deathTimer <= 0) {
-          this.scene.remove(z.group);
+          // El modelo del zombi usa geometrías/materiales compartidos de
+          // MaterialLibrary + recursos propios potenciales: recorrer y liberar
+          // solo los exclusivos evita fuga sin romper mallas aún en uso.
+          this.removeAndDispose(z.group);
           this.zombies.splice(i, 1);
         }
         continue;
@@ -2108,19 +2198,30 @@ export class ThreeGameEngine {
         zPos.z += Math.cos(angleToTarget) * moveDist;
       }
 
-      for (let j = 0; j < this.zombies.length; j++) {
-        if (i === j || this.zombies[j].isDying) continue;
-        const otherPos = this.zombies[j].group.position;
+      // Separación entre zombis: se recorre SOLO una vez por par (j > i) y el
+      // impulso se aplica simétricamente a ambos. Antes cada zombi comparaba
+      // contra TODOS (O(n^2) completo, ~n*(n-1) hipótesis de distancia); ahora
+      // son ~la mitad de comprobaciones con idéntico resultado físico.
+      for (let j = i + 1; j < this.zombies.length; j++) {
+        const other = this.zombies[j];
+        if (other.isDying || z.isDying) continue;
+        const otherPos = other.group.position;
         const dx = zPos.x - otherPos.x;
         const dz = zPos.z - otherPos.z;
         const dist = Math.hypot(dx, dz);
-        const minDist = (z.data.radius + this.zombies[j].data.radius) * 0.075;
+        const minDist = (z.data.radius + other.data.radius) * 0.075;
         if (dist < minDist && dist > 0) {
           const push = (minDist - dist) * 0.5;
-          zPos.x += (dx / dist) * push;
-          zPos.z += (dz / dist) * push;
+          const ux = dx / dist;
+          const uz = dz / dist;
+          zPos.x += ux * push;
+          zPos.z += uz * push;
+          otherPos.x -= ux * push;
+          otherPos.z -= uz * push;
         }
       }
+
+      if (this.gameOverTriggered) return;
 
       if (dstToPlayer < 1.9 && z.data.attackTimer <= 0) {
         z.data.attackTimer = z.data.attackCooldown;
@@ -2440,14 +2541,22 @@ export class ThreeGameEngine {
   }
 
   public interact() {
+    if (this.destroyed || this.gameOverTriggered) return;
     const pPos = this.playerMeshObj.group.position;
     const dstBox = Math.hypot(pPos.x - this.mysteryBox.x, pPos.z - this.mysteryBox.y);
-    if (dstBox < 4.8) {
+    const dstWorkshop = Math.hypot(pPos.x - this.workshopLocation.x, pPos.z - this.workshopLocation.z);
+
+    // Resuelve ambas interacciones por proximidad: si el jugador está a rango
+    // de los dos, gana el más cercano (antes E solo abría la caja).
+    if (dstBox < 4.8 && dstBox <= dstWorkshop) {
       // No cobrar aquí: el modal solicitará el giro vía requestMysterySpin(),
       // que es la única operación que cobra y genera la recompensa (una vez).
       // Así se evita el doble cobro (interact + apertura de modal).
       this.callbacks.onOpenMysteryBox();
       return;
+    }
+    if (dstWorkshop < 4.8) {
+      this.callbacks.onOpenWorkshop?.();
     }
   }
 
@@ -2469,16 +2578,58 @@ export class ThreeGameEngine {
     sound.playCoin();
     this.syncPlayerState();
 
-    return rollMysteryBox();
+    // El drop se REGISTRA como pendiente: solo ese objeto exacto podrá
+    // reclamarse después (anti doble-reclamación y anti drops fabricados).
+    const drop = rollMysteryBox();
+    this.pendingDrop = drop;
+    return drop;
   }
 
-  /** La UI llama esto cuando termina la animación del giro (o al cerrarse el modal). */
+  /**
+   * La UI llama esto cuando la animación del giro FINALIZA y el premio ha sido
+   * reclamado (applyMysteryDrop) o cuando se cancela con devolución
+   * (cancelMysterySpin). No debe liberar el bloqueo mientras exista un premio
+   * pendiente de reclamar.
+   */
   public resolveMysterySpin() {
+    if (this.pendingDrop) return; // hay un premio sin reclamar: no liberar aún
     this.spinPending = false;
+  }
+
+  /**
+   * Cancela un giro cuyo premio NO llegó a reclamarse (el usuario cerró el
+   * modal durante la animación o el motor fue destruido). Devuelve exactamente
+   * el coste cobrado una única vez e impide reclamar ese premio después, de
+   * modo que ningún pago se pierde ni se sustituye silenciosamente.
+   */
+  public cancelMysterySpin(cost: number) {
+    if (!this.spinPending) return; // ya resuelto/cancelado: sin doble devolución
+    this.spinPending = false;
+    this.pendingDrop = null;
+    if (!this.destroyed && cost > 0) {
+      this.player.coins += cost;
+      this.syncPlayerState();
+    }
+  }
+
+  public getMysteryBoxCost(): number {
+    return this.mysteryBox.cost;
   }
 
   public applyMysteryDrop(drop: MysteryBoxDrop) {
+    // Protección terminal equivalente a requestMysterySpin(): tras GAME_OVER o
+    // destroy no se aplica ninguna recompensa (y se libera el bloqueo para no
+    // dejar giros colgados).
+    if (this.destroyed || this.gameOverTriggered) {
+      this.spinPending = false;
+      this.pendingDrop = null;
+      return;
+    }
+    // Anti doble-reclamación: si llega un drop distinto al registrado por el
+    // motor (stale/duplicado/fabricado por la UI), se ignora sin efectos.
+    if (this.pendingDrop && this.pendingDrop !== drop) return;
     this.spinPending = false;
+    this.pendingDrop = null;
     if (drop.type === 'weapon' && drop.weaponTemplate && drop.weaponTemplate.id) {
       const weaponInstance = createWeaponInstance(drop.weaponTemplate.id);
       const existingIdx = this.player.weapons.findIndex((w) => w.id === weaponInstance.id);
